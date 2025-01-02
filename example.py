@@ -37,7 +37,7 @@ def postrun_handler(task_id, task_name, result, status):
 
 
 async def main():
-    n_tasks = 1
+    n_tasks = 10
     for _ in range(n_tasks):
         workcraft.send_task_sync(
             task_name="simple_task",

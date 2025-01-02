@@ -1,6 +1,6 @@
 import json
+import signal
 import threading
-import time
 import uuid
 from queue import Empty, Queue
 
@@ -55,31 +55,47 @@ class Peon:
                 logger.error(f"Failed to send peon update: {e}")
 
     def work(self) -> None:
-        logger.info("Starting peon...")
+        """
+        Main work method that starts all worker threads and maintains the main loop.
+        """
 
-        self._sse_thread.start()
-        logger.info("Started SSE thread")
-
-        self._heartbeat_thread.start()
-        logger.info("Started heartbeat thread")
-        self._processor_thread.start()
-        logger.info("Started processor thread")
-
-        self._statistics_thread.start()
-        logger.info("Started statistics thread")
-        logger.info(f"Peon ID {self.id}")
-        available_tasks = self.workcraft.tasks.keys()
-        logger.info("Available Tasks:")
-        for task in available_tasks:
-            logger.info(f" - {task}")
-
-        logger.success("Zug Zug. Ready to work!")
         try:
+            logger.info("Starting peon...")
+
+            # Start all threads
+            self._sse_thread.start()
+            logger.info("Started SSE thread")
+
+            self._heartbeat_thread.start()
+            logger.info("Started heartbeat thread")
+
+            self._processor_thread.start()
+            logger.info("Started processor thread")
+
+            self._statistics_thread.start()
+            logger.info("Started statistics thread")
+
+            logger.info(f"Peon ID {self.id}")
+            available_tasks = self.workcraft.tasks.keys()
+            logger.info("Available Tasks:")
+            for task in available_tasks:
+                logger.info(f" - {task}")
+
+            logger.success("Zug Zug. Ready to work!")
+
+            # Main loop with proper signal handling
             while not self._stop_event.is_set():
-                self._stop_event.wait(1)  # Wait with timeout
-        except KeyboardInterrupt:
-            logger.info("Received keyboard interrupt")
-            self.stop()
+                try:
+                    for _ in range(10):  # 10 * 0.1 = 1 second total
+                        if self._stop_event.is_set():
+                            break
+                        self._stop_event.wait(0.1)
+                except KeyboardInterrupt:
+                    logger.info("Received keyboard interrupt in main thread")
+                    break
+
+        except Exception as e:
+            logger.error(f"Error in main work loop: {e}")
 
     def _cancel_task_in_queue(self, task_id: str) -> None:
         # Remove task from queue
@@ -174,14 +190,13 @@ class Peon:
                 # Monitor for cancellation or completion
                 cancelled = False
                 while task_thread.is_alive():
-                    if (
-                        self._task_cancelled.is_set() or self._stop_event.is_set()
-                    ):  # Check both events
-                        logger.info("Task cancellation requested")
+                    if self._task_cancelled.is_set() or self._stop_event.is_set():
+                        if self._task_cancelled.is_set():
+                            logger.info("Task cancellation requested")
+                            task.status = "CANCELLED"
                         task_thread.join(timeout=5)
                         if task_thread.is_alive():
                             logger.warning("Task did not stop gracefully")
-                        task.status = "CANCELLED"
                         cancelled = True
                         break
                     task_thread.join(timeout=1)
@@ -240,126 +255,74 @@ class Peon:
 
     def _run_sse(self):
         logger.info("Starting SSE thread")
+        retry_delay = 5  # Start with 5 seconds delay
+        max_retry_delay = 60  # Maximum delay between retries
 
         while self.working and not self._stop_event.is_set():
-            print("Connecting to server...")
             try:
                 logger.info(f"Attempting connection to {self.workcraft.stronghold_url}")
                 response = requests.get(
                     f"{self.workcraft.stronghold_url}/events?type=peon&peon_id={self.id}&queues={self.state.queue_to_stronghold()}",
                     stream=True,
+                    headers={"WORKCRAFT_API_KEY": self.workcraft.api_key},
+                    timeout=30,
                 )
-                print(response.status_code)
+
                 if response.status_code != 200:
                     logger.error(f"Failed to connect to server: {response.text}")
-                    time.sleep(5)
+                    self._handle_connection_failure(retry_delay)
+                    retry_delay = min(
+                        retry_delay * 2, max_retry_delay
+                    )  # Exponential backoff
                     continue
-                for line in response.iter_content(chunk_size=None):
-                    if line:
-                        try:
-                            msg = line.decode().split("data:")[1]
-                            msg = json.loads(msg)
 
-                            logger.info(f"Received message: {msg}")
-                            if msg["type"] == "new_task":
-                                try:
-                                    task = Task.model_validate(msg["data"])
-                                except Exception as e:
-                                    logger.error(
-                                        f"Failed to validate task: {e}, likely malformed."
-                                        " Setting task to INVALID"
-                                    )
-                                    task_id = msg["payload"]["id"]
-                                    if not task_id:
-                                        logger.error("Task ID is missing")
-                                        continue
+                retry_delay = 5
+                self.connected = False
 
-                                    res = requests.post(
-                                        f"{self.workcraft.stronghold_url}/api/task/{task_id}/update",
-                                        headers={
-                                            "WORKCRAFT_API_KEY": self.workcraft.api_key
-                                        },
-                                        json={
-                                            "status": "INVALID",
-                                            "result": f"Task is invalid: {e}",
-                                        },
-                                    )
+                # Process the stream
+                for line in response.iter_lines(decode_unicode=True):
+                    if self._stop_event.is_set():
+                        logger.info("Stop event detected during SSE processing")
+                        return
 
-                                    if 200 <= res.status_code < 300:
-                                        logger.info(f"Task {task_id} set to INVALID")
-                                    else:
-                                        logger.error(
-                                            f"Failed to set task to INVALID: {res.text}"
-                                        )
-                                    continue
+                    if not line:
+                        continue
 
-                                if task.id in self.seen_tasks_in_memory:
-                                    logger.info(
-                                        f"Task {task.id} already seen, skipping"
-                                    )
-                                    continue
+                    if not line.startswith("data:"):
+                        continue
 
-                                task.peon_id = self.id
-                                self.queue.put(task)
+                    try:
+                        msg = json.loads(line[5:])  # Skip 'data:' prefix
+                        logger.info(f"Received message: {msg}")
 
-                                self.seen_tasks_in_memory.add(task.id)
+                        if msg["type"] == "new_task":
+                            self._handle_new_task(msg)
+                        elif msg["type"] == "cancel_task":
+                            self._handle_cancel_task(msg)
+                        elif msg["type"] == "connected":
+                            self.connected = True
+                            logger.info("Connected to server")
 
-                                try:
-                                    res = requests.post(
-                                        self.workcraft.stronghold_url
-                                        + f"/api/task/{task.id}/update",
-                                        headers={
-                                            "WORKCRAFT_API_KEY": self.workcraft.api_key
-                                        },
-                                        json={
-                                            "peon_id": self.id,
-                                            "status": "ACKNOWLEDGED",
-                                        },
-                                    )
+                    except json.JSONDecodeError:
+                        logger.warning(f"Received invalid JSON: {line}")
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error processing message: {e}")
+                        continue
 
-                                    if 200 <= res.status_code < 300:
-                                        logger.info(
-                                            "Task acknowledgement sent successfully"
-                                        )
-                                    else:
-                                        logger.error(
-                                            f"Failed to send task acknowledgement: {res.text}"
-                                        )
-                                except Exception as e:
-                                    logger.error(
-                                        f"Failed to send task acknowledgement: {e}"
-                                    )
-
-                            elif msg["type"] == "cancel_task":
-                                task_id = msg["payload"]
-                                # either cancel the current task or remove from queue
-                                if (
-                                    self.state.current_task
-                                    and self.state.current_task == task_id
-                                ):
-                                    self._task_cancelled.set()
-                                    logger.info("Task cancellation acknowledged")
-                                else:
-                                    self._cancel_task_in_queue(task_id)
-                            elif msg["type"] == "connected":
-                                self.connected = True
-                                logger.info("Connected to server")
-
-                        except IndexError:
-                            logger.debug(f"Received non-event line: {line.decode()}")
-                            continue
-                        except json.JSONDecodeError:
-                            logger.warning(f"Received invalid JSON: {line.decode()}")
-                            continue
             except requests.exceptions.ConnectionError as e:
-                logger.info(
-                    f"Failed to retrieve stream, likely because server is offline. "
-                    f"Raw error: {e}"
-                )
-                continue
+                logger.error(f"Connection error: {e}")
+                self._handle_connection_failure(retry_delay)
+                retry_delay = min(retry_delay * 2, max_retry_delay)
+            except requests.exceptions.Timeout:
+                logger.error("Connection timed out")
+                self._handle_connection_failure(retry_delay)
+                retry_delay = min(retry_delay * 2, max_retry_delay)
             except Exception as e:
-                logger.error(f"Failed to receive message: {e}")
-                continue
+                logger.error(f"Unexpected error in SSE thread: {e}")
+                self._handle_connection_failure(retry_delay)
+                retry_delay = min(retry_delay * 2, max_retry_delay)
+
         logger.info("SSE thread stopped")
 
     def stop(self):
@@ -369,7 +332,6 @@ class Peon:
             logger.info("Initiating shutdown...")
             self.working = False
             self._stop_event.set()
-            self._task_cancelled.set()
             # Set a timeout for joining threads
             timeout = 5
             threads = [
@@ -386,6 +348,28 @@ class Peon:
                         f"Thread {thread.name} did not terminate within {timeout}s"
                     )
 
+            def _reset_task_to_pending(task_id, json_data):
+                try:
+                    res = requests.post(
+                        f"{self.workcraft.stronghold_url}/api/task/{task_id}/update",
+                        headers={"WORKCRAFT_API_KEY": self.workcraft.api_key},
+                        json=json_data,
+                    )
+
+                    if 200 <= res.status_code < 300:
+                        logger.info(f"Task {task_id} reset to PENDING")
+                    else:
+                        logger.error(f"Failed to reset task {task_id}: {res.text}")
+                except Exception as e:
+                    logger.error(f"Failed to reset task: {e}")
+
+            if self.state.current_task:
+                self._update_and_send_state(current_task=None)
+                # set task back to pending
+                _reset_task_to_pending(
+                    self.state.current_task, {"status": "PENDING", "peon_id": None}
+                )
+
             # clean up the queue and set tasks back to PENDING
 
             while not self.queue.empty():
@@ -394,16 +378,7 @@ class Peon:
                     task.status = "PENDING"
                     task.peon_id = None
 
-                    res = requests.post(
-                        f"{self.workcraft.stronghold_url}/api/task/{task.id}/update",
-                        headers={"WORKCRAFT_API_KEY": self.workcraft.api_key},
-                        json=Task.to_stronghold(task),
-                    )
-
-                    if 200 <= res.status_code < 300:
-                        logger.info(f"Task {task.id} reset to PENDING")
-                    else:
-                        logger.error(f"Failed to reset task {task.id}: {res.text}")
+                    _reset_task_to_pending(task.id, Task.to_stronghold(task))
 
                     self.queue.task_done()
 
@@ -411,3 +386,82 @@ class Peon:
                     logger.error(f"Failed to reset task: {e}")
 
             logger.info("Stopped peon")
+
+    def _handle_connection_failure(self, delay):
+        """Handle connection failures with appropriate delay and state updates."""
+        self.connected = False
+        logger.info(f"Connection lost. Retrying in {delay} seconds...")
+        self._stop_event.wait(delay)
+
+    def _handle_new_task(self, msg):
+        """Handle new task messages."""
+        try:
+            task = Task.model_validate(msg["data"])
+        except Exception as e:
+            self._handle_invalid_task(msg, e)
+            return
+
+        if task.id in self.seen_tasks_in_memory:
+            logger.info(f"Task {task.id} already seen, skipping")
+            return
+
+        self._process_new_task(task)
+
+    def _handle_invalid_task(self, msg, error):
+        """Handle invalid task messages."""
+        logger.error(
+            f"Failed to validate task: {error}, likely malformed. Setting task to INVALID"
+        )
+        try:
+            task_id = msg["data"]["id"]
+            if not task_id:
+                logger.error("Task ID is missing")
+                return
+
+            res = requests.post(
+                f"{self.workcraft.stronghold_url}/api/task/{task_id}/update",
+                headers={"WORKCRAFT_API_KEY": self.workcraft.api_key},
+                json={
+                    "status": "INVALID",
+                    "result": f"Task is invalid: {error}",
+                },
+            )
+
+            if 200 <= res.status_code < 300:
+                logger.info(f"Task {task_id} set to INVALID")
+            else:
+                logger.error(f"Failed to set task to INVALID: {res.text}")
+        except Exception as e:
+            logger.error(f"Error handling invalid task: {e}")
+
+    def _process_new_task(self, task):
+        """Process a new valid task."""
+        task.peon_id = self.id
+        self.queue.put(task)
+        self.seen_tasks_in_memory.add(task.id)
+
+        try:
+            res = requests.post(
+                f"{self.workcraft.stronghold_url}/api/task/{task.id}/update",
+                headers={"WORKCRAFT_API_KEY": self.workcraft.api_key},
+                json={
+                    "peon_id": self.id,
+                    "status": "ACKNOWLEDGED",
+                },
+            )
+
+            if 200 <= res.status_code < 300:
+                logger.info("Task acknowledgement sent successfully")
+            else:
+                logger.error(f"Failed to send task acknowledgement: {res.text}")
+        except Exception as e:
+            logger.error(f"Failed to send task acknowledgement: {e}")
+
+    def _handle_cancel_task(self, msg):
+        """Handle cancel task messages."""
+        task_id = msg["data"]
+        if self.state.current_task and self.state.current_task == task_id:
+            self._task_cancelled.set()
+            logger.info("Task cancellation acknowledged")
+        else:
+            self._cancel_task_in_queue(task_id)
