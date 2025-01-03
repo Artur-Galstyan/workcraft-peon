@@ -1,5 +1,4 @@
 import json
-import signal
 import threading
 import uuid
 from queue import Empty, Queue
@@ -255,8 +254,8 @@ class Peon:
 
     def _run_sse(self):
         logger.info("Starting SSE thread")
-        retry_delay = 5  # Start with 5 seconds delay
-        max_retry_delay = 60  # Maximum delay between retries
+        retry_delay = 1
+        max_retry_delay = 60
 
         while self.working and not self._stop_event.is_set():
             try:
