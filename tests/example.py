@@ -73,8 +73,9 @@ json_str = json.dumps(data)  # Convert to JSON string if needed
 
 
 stronghold_url = "http://localhost:6112"
+redis_url = "redis://localhost:6379/0"
 api_key = "abcd"
-workcraft = Workcraft(stronghold_url, api_key)
+workcraft = Workcraft(stronghold_url, redis_url, api_key)
 
 global_counter = 0
 
@@ -93,7 +94,7 @@ def simple_task(task_id: str, a: str) -> int:
     print("Regular print")
     logging.info("Standard logging")
     sys.stderr.write("Direct stderr write\n")
-    time.sleep(100)
+    time.sleep(3)
     # if random.randint(0, 10) < 2:
     #     raise ValueError("This is a test error mon")
 
