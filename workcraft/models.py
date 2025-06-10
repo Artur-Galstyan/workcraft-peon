@@ -1,13 +1,18 @@
-import hashlib
 import json
 import uuid
 from collections.abc import Callable
 from datetime import datetime
+from typing import ClassVar
 
 import requests
 from beartype.typing import Any, Literal, Protocol
 from loguru import logger
 from pydantic import BaseModel, Field
+
+
+class Separators(BaseModel):
+    WORKCRAFT_SSE_SEPARATOR_START: ClassVar = "###WORKCRAFT_MESSAGE_START###"
+    WORKCRAFT_SSE_SEPARATOR_END: ClassVar = "###WORKCRAFT_MESSAGE_END###"
 
 
 class WebsocketMessage(BaseModel):
@@ -99,10 +104,7 @@ class Workcraft:
 
     def __init__(self, stronghold_url: str, api_key: str):
         self.stronghold_url = stronghold_url
-
-        m = hashlib.sha256()
-        m.update(api_key.encode())
-        self.api_key = m.hexdigest()
+        self.api_key = api_key
 
         self.tasks: dict[str, Callable] = {}
         self.setup_handler_fn: Callable | None = None
@@ -138,46 +140,31 @@ class Workcraft:
         return decorator
 
     def execute(self, task: Task) -> Task:
-        try:
-            if self.prerun_handler_fn:
-                try:
-                    self.prerun_handler_fn(
-                        task.id,
-                        task.task_name,
-                        *task.payload.prerun_handler_args,
-                        **task.payload.prerun_handler_kwargs,
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to execute prerun handler: {e}")
-                    logger.warning(
-                        f"Task {task.id} will still be executed, "
-                        "but the prerun handler failed. This may cause issues "
-                        "with the task execution. Please check the logs."
-                    )
+        if self.prerun_handler_fn:
+            try:
+                self.prerun_handler_fn(
+                    task.id,
+                    task.task_name,
+                    *task.payload.prerun_handler_args,
+                    **task.payload.prerun_handler_kwargs,
+                )
+            except Exception as e:
+                import traceback
 
+                print(traceback.format_exc())
+                logger.warning(f"Failed to execute prerun handler: {e}")
+                logger.warning(
+                    f"Task {task.id} will still be executed, "
+                    "but the prerun handler failed. This may cause issues "
+                    "with the task execution. Please check the logs."
+                )
+        try:
             task_fn = self.tasks[task.task_name]
             result = task_fn(
                 task.id, *task.payload.task_args, **task.payload.task_kwargs
             )
             task.result = json.dumps(result)
             task.status = "SUCCESS"
-
-            if self.postrun_handler_fn:
-                try:
-                    self.postrun_handler_fn(
-                        task.id,
-                        task.task_name,
-                        result,
-                        task.status,
-                        *task.payload.postrun_handler_args,
-                        **task.payload.postrun_handler_kwargs,
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to execute postrun handler: {e}")
-                    logger.warning(
-                        f"Task {task.id} was executed successfully, "
-                        "but the postrun handler failed. Please check the logs."
-                    )
 
         except Exception as e:
             import traceback
@@ -188,6 +175,25 @@ class Workcraft:
             task.result = str(e)
         finally:
             task.updated_at = datetime.now()
+            if self.postrun_handler_fn:
+                try:
+                    self.postrun_handler_fn(
+                        task.id,
+                        task.task_name,
+                        task.result,
+                        task.status,
+                        *task.payload.postrun_handler_args,
+                        **task.payload.postrun_handler_kwargs,
+                    )
+                except Exception as e:
+                    import traceback
+
+                    print(traceback.format_exc())
+                    logger.warning(f"Failed to execute postrun handler: {e}")
+                    logger.warning(
+                        f"Task {task.id} was executed successfully, "
+                        "but the postrun handler failed. Please check the logs."
+                    )
             return task
 
     def send_task_sync(

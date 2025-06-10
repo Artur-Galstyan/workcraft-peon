@@ -1,6 +1,6 @@
 [project]
 name = "workcraft-peon"
-version = "0.1.7"
+version = "0.1.18"
 description = "The worker library that eats celery for breakfast"
 readme = "README.md"
 requires-python = ">=3.10"

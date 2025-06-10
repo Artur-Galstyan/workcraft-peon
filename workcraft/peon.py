@@ -1,13 +1,15 @@
 import datetime
 import json
 import threading
+import time
 import uuid
 from queue import Empty, Queue
 
 import requests
 from loguru import logger
+from requests.adapters import HTTPAdapter
 
-from workcraft.models import Task, Workcraft
+from workcraft.models import Separators, Task, Workcraft
 from workcraft.utils import capture_all_output, tenacious_request
 
 
@@ -35,6 +37,10 @@ class Peon:
         self._stop_event = threading.Event()
         self._task_cancelled = threading.Event()
 
+        self.last_heartbeat_print = datetime.datetime.now()
+        self.last_heartbeat_length = 0
+        self.heartbeat_messages = []
+
     def _sync(self, data: dict) -> None:
         if self.connected:
             try:
@@ -45,6 +51,9 @@ class Peon:
                         json=data,
                     )
                 )
+
+                if "current_task_set" in data and "current_task" in data:
+                    self.current_task = data["current_task"]
 
                 if 200 <= res.status_code < 300:
                     pass
@@ -83,30 +92,10 @@ class Peon:
             self.stop()
 
     def _cancel_task_in_queue(self, task_id: str) -> None:
-        # Remove task from queue
         for i in range(self.queue.qsize()):
             task = self.queue.get()
             if task.id != task_id:
                 self.queue.put(task)
-            else:
-                logger.info(f"Removing task {task_id} from queue")
-                task.status = "CANCELLED"
-
-                res = tenacious_request(
-                    lambda: requests.post(
-                        f"{self.workcraft.stronghold_url}/api/task/{task.id}/update",
-                        headers={"WORKCRAFT_API_KEY": self.workcraft.api_key},
-                        json=Task.to_stronghold(task),
-                    )
-                )
-
-                if 200 <= res.status_code < 300:
-                    logger.info(f"Task {task_id} removed from queue")
-                else:
-                    logger.error(f"Failed to remove task from queue: {res.text}")
-
-                self.queue.task_done()
-                break
         logger.info(f"Task {task_id} removed from queue")
 
     def _statistics(self) -> None:
@@ -150,7 +139,6 @@ class Peon:
                         "status_set": True,
                     }
                 )
-                self.current_task = None
                 continue
 
             try:
@@ -181,12 +169,10 @@ class Peon:
                 result_queue = Queue()
 
                 def execute_task(_task):
-                    try:
-                        with capture_all_output(self.workcraft, task.id):
-                            result = self.workcraft.execute(_task)
-                            result_queue.put(result)
-                    except Exception as e:
-                        result_queue.put(e)
+                    with capture_all_output(self.workcraft, task.id):
+                        result = self.workcraft.execute(_task)
+                        result_queue.put(result)
+                        return
 
                 task_thread = threading.Thread(target=execute_task, args=(task,))
                 task_thread.start()
@@ -194,9 +180,7 @@ class Peon:
                 # Monitor for cancellation or completion
                 cancelled = False
                 while task_thread.is_alive():
-                    if (
-                        self._task_cancelled.is_set() or self._stop_event.is_set()
-                    ):  # Check both events
+                    if self._task_cancelled.is_set() or self._stop_event.is_set():
                         logger.info("Task cancellation requested")
                         task_thread.join(timeout=5)
                         if task_thread.is_alive():
@@ -270,7 +254,7 @@ class Peon:
                 )
             except Exception as e:
                 logger.error(f"Failed to send ping: {e}")
-            self._stop_event.wait(5)  # Replace sleep with event wait
+            self._stop_event.wait(5)
 
     def _queue_to_stronghold(self) -> str:
         if self.queues is None:
@@ -279,36 +263,66 @@ class Peon:
 
     def _run_sse(self):
         logger.info("Starting SSE thread")
+        session = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=1, pool_maxsize=1, max_retries=10, pool_block=False
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
 
         while self.working and not self._stop_event.is_set():
             print("Connecting to server after 5 seconds...")
             self._stop_event.wait(5)
             try:
                 logger.info(f"Attempting connection to {self.workcraft.stronghold_url}")
-                response = requests.get(
+                response = session.get(
                     f"{self.workcraft.stronghold_url}/events?type=peon&peon_id={self.id}&queues={self._queue_to_stronghold()}",
                     stream=True,
-                    headers={"WORKCRAFT_API_KEY": self.workcraft.api_key},
+                    headers={
+                        "WORKCRAFT_API_KEY": self.workcraft.api_key,
+                        "Connection": "keep-alive",
+                        "Keep-Alive": "timeout=60, max=1000",
+                    },
+                    timeout=(5, 30),
                 )
                 if response.status_code != 200:
                     logger.error(f"Failed to connect to server: {response.text}")
                     self._stop_event.wait(5)
                     continue
                 buffer = ""
+                buffer_last_update = time.time()
+                max_buffer_age = 60
                 for line in response.iter_content(chunk_size=None):
                     if line:
                         try:
+                            current_time = time.time()
+                            if (
+                                buffer
+                                and current_time - buffer_last_update > max_buffer_age
+                            ):
+                                logger.warning(
+                                    f"Discarding stale buffer after {max_buffer_age} seconds: {buffer[:100]}..."
+                                )
+                                buffer = ""
                             buffer += line.decode()
-
-                            if not buffer.endswith("\n\n"):
+                            buffer_last_update = current_time
+                            if not buffer.endswith(
+                                Separators.WORKCRAFT_SSE_SEPARATOR_END
+                            ):
                                 continue
 
-                            msg = buffer.split("data:")[1]
+                            if not buffer.startswith(
+                                Separators.WORKCRAFT_SSE_SEPARATOR_START
+                            ) and not buffer.endswith(
+                                Separators.WORKCRAFT_SSE_SEPARATOR_END
+                            ):
+                                raise ValueError("Invalid buffer data received")
+                            msg = buffer.split(
+                                Separators.WORKCRAFT_SSE_SEPARATOR_START
+                            )[1].split(Separators.WORKCRAFT_SSE_SEPARATOR_END)[0]
                             msg = json.loads(msg)
-
                             buffer = ""
-                            logger.info(f"Received message: {msg}")
-                            if msg["type"] == "new_task":
+                            if msg["type"] == "new_task" and self.connected:
                                 try:
                                     task = Task.model_validate(msg["data"])
                                 except Exception as e:
@@ -388,10 +402,9 @@ class Peon:
                                     logger.error(
                                         f"Failed to send task acknowledgement: {e}"
                                     )
-
-                            elif msg["type"] == "cancel_task":
-                                task_id = msg["payload"]
-                                # either cancel the current task or remove from queue
+                            elif msg["type"] == "cancel_task" and self.connected:
+                                logger.info(f"Received message: {msg}")
+                                task_id = msg["task_id"]
                                 if self.current_task and self.current_task == task_id:
                                     self._task_cancelled.set()
                                     logger.info("Task cancellation acknowledged")
@@ -400,12 +413,29 @@ class Peon:
                             elif msg["type"] == "connected":
                                 self.connected = True
                                 logger.info("Connected to server")
+                            elif msg["type"] == "heartbeat":
+                                self.heartbeat_messages.append(msg)
+                                time_since_last_print = (
+                                    datetime.datetime.now() - self.last_heartbeat_print
+                                ).seconds
+
+                                if time_since_last_print > 30:
+                                    logger.info(
+                                        f"Got {len(self.heartbeat_messages) - self.last_heartbeat_length}"
+                                        " heartbeats in the last 30 seconds"
+                                    )
+                                    self.last_heartbeat_print = datetime.datetime.now()
+                                    self.last_heartbeat_length = len(
+                                        self.heartbeat_messages
+                                    )
 
                         except IndexError:
                             logger.debug(f"Received non-event line: {line.decode()}")
+                            self._stop_event.wait(5)
                             continue
                         except json.JSONDecodeError:
-                            logger.warning(f"Received invalid JSON: {line.decode()}")
+                            logger.warning(f"Received invalid JSON: {msg}")
+                            self._stop_event.wait(5)
                             continue
             except requests.exceptions.ConnectionError as e:
                 logger.info(
